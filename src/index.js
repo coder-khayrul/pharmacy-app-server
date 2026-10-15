@@ -32,6 +32,9 @@ const mongoClient = new MongoClient(process.env.MONGODB_URI);
 const verifications = mongoClient
   .db(process.env.MONGODB_DB || "pharmacare")
   .collection("signupVerifications");
+const medicines = mongoClient
+  .db(process.env.MONGODB_DB || "pharmacare")
+  .collection("medicines");
 const otpLifetimeMs = 10 * 60 * 1000;
 const maxOtpAttempts = 5;
 
@@ -66,6 +69,8 @@ const firebasePermissionMessage =
   "Firebase Admin lacks permission to access Authentication. Grant the service account the Firebase Authentication Admin role in the configured Firebase project, then restart the server.";
 const firebaseConfigurationMessage =
   "Firebase Authentication is not configured for the project used by the server. In Firebase Console, finish setting up Authentication and enable Email/Password sign-in for that project.";
+const firebaseProjectMismatchMessage =
+  "This app is connected to a different Firebase project than the server. Restart the app with a fresh bundle configured for the server's Firebase project, then try signing up again.";
 const createMailer = () => {
   const { SMTP_HOST: host, SMTP_USER: user, SMTP_PASSWORD: password, SMTP_FROM: from } = process.env;
   if (!host || !user || !password || !from) {
@@ -81,6 +86,50 @@ const createMailer = () => {
 };
 
 app.get("/api/health", (_request, response) => response.json({ ok: true }));
+
+app.get("/api/medicines", async (request, response) => {
+  try {
+    const idToken = request.headers.authorization?.replace(/^Bearer\s+/i, "");
+    if (!idToken) return response.status(401).json({ message: "Sign in to view medicines." });
+
+    await firebaseAuth.verifyIdToken(idToken);
+    const records = await medicines
+      .find({ isActive: { $ne: false } })
+      .project({ name: 1, currentStock: 1, reorderLevel: 1 })
+      .sort({ name: 1 })
+      .toArray();
+    const inventory = records.map((medicine) => {
+      if (
+        typeof medicine.name !== "string" ||
+        typeof medicine.currentStock !== "number" ||
+        !Number.isFinite(medicine.currentStock) ||
+        typeof medicine.reorderLevel !== "number" ||
+        !Number.isFinite(medicine.reorderLevel)
+      ) {
+        throw new Error(`Medicine ${medicine._id} is missing a valid name, currentStock, or reorderLevel.`);
+      }
+
+      return {
+        id: medicine._id.toString(),
+        name: medicine.name,
+        currentStock: medicine.currentStock,
+        reorderLevel: medicine.reorderLevel,
+      };
+    });
+
+    return response.json({ medicines: inventory });
+  } catch (error) {
+    console.error("Medicine inventory request failed", error);
+    const invalidToken = [
+      "auth/argument-error",
+      "auth/id-token-expired",
+      "auth/invalid-id-token",
+    ].includes(error.code);
+    return response.status(invalidToken ? 401 : 500).json({
+      message: invalidToken ? "Your session has expired. Please log in again." : "Unable to load medicine inventory.",
+    });
+  }
+});
 
 app.post("/api/auth/signup/request-code", async (request, response) => {
   try {
@@ -214,21 +263,32 @@ app.post("/api/auth/signup/complete", async (request, response) => {
   } catch (error) {
     console.error("Signup completion failed", error);
     const badToken = error.name === "JsonWebTokenError" || error.name === "TokenExpiredError";
+    const firebaseProjectMismatch =
+      error.code === "auth/argument-error" &&
+      /incorrect "aud" \(audience\) claim/i.test(error.message || "");
     const firebaseError = isFirebaseCredentialError(error);
     const permissionError = isFirebasePermissionError(error);
     const firebaseAuthConfigurationError = isFirebaseConfigurationError(error);
     return response.status(
-      firebaseError || permissionError || firebaseAuthConfigurationError ? 503 : badToken ? 403 : 500,
+      firebaseError || permissionError || firebaseAuthConfigurationError
+        ? 503
+        : firebaseProjectMismatch
+          ? 401
+          : badToken
+            ? 403
+            : 500,
     ).json({
       message: permissionError
         ? firebasePermissionMessage
         : firebaseAuthConfigurationError
           ? firebaseConfigurationMessage
-          : firebaseError
-          ? firebaseCredentialMessage
-          : badToken
-            ? "Your verification session expired. Request and verify a new code."
-            : "Unable to complete your account setup.",
+          : firebaseProjectMismatch
+            ? firebaseProjectMismatchMessage
+            : firebaseError
+              ? firebaseCredentialMessage
+              : badToken
+                ? "Your verification session expired. Request and verify a new code."
+                : "Unable to complete your account setup.",
     });
   }
 });
