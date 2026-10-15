@@ -37,11 +37,64 @@ const medicines = mongoClient
   .collection("medicines");
 const otpLifetimeMs = 10 * 60 * 1000;
 const maxOtpAttempts = 5;
+const adminEmails = new Set(
+  (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean),
+);
+const staffEmails = new Set(
+  (process.env.STAFF_EMAILS || "")
+    .split(",")
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 app.use(cors());
 app.use(express.json({ limit: "16kb" }));
 
 const normalizeEmail = (email) => email.trim().toLowerCase();
+const roleForEmail = (email) => {
+  if (adminEmails.has(email)) return "admin";
+  if (staffEmails.has(email)) return "staff";
+  return "customer";
+};
+const validRoles = new Set(["customer", "staff", "admin"]);
+const authenticate = async (request, response, next) => {
+  const idToken = request.headers.authorization?.replace(/^Bearer\s+/i, "");
+  if (!idToken) return response.status(401).json({ message: "Sign in to continue." });
+
+  try {
+    const decodedToken = await firebaseAuth.verifyIdToken(idToken);
+    const isProvisionedAccount =
+      decodedToken.email_verified === true &&
+      decodedToken.emailOtpVerified === true &&
+      validRoles.has(decodedToken.role);
+    request.authUser = {
+      uid: decodedToken.uid,
+      email: decodedToken.email || "",
+      role: isProvisionedAccount ? roleForEmail((decodedToken.email || "").toLowerCase()) : "customer",
+    };
+    return next();
+  } catch (error) {
+    console.error("Authentication token verification failed", error);
+    const invalidToken = [
+      "auth/argument-error",
+      "auth/id-token-expired",
+      "auth/invalid-id-token",
+      "auth/user-disabled",
+    ].includes(error.code);
+    return response.status(invalidToken ? 401 : 500).json({
+      message: invalidToken ? "Your session has expired. Please log in again." : "Unable to verify your session.",
+    });
+  }
+};
+const requireRoles = (...roles) => (request, response, next) => {
+  if (!roles.includes(request.authUser?.role)) {
+    return response.status(403).json({ message: "You do not have permission to access this resource." });
+  }
+  return next();
+};
 const hashCode = (code) => createHash("sha256").update(code).digest();
 const toBuffer = (value) => {
   if (Buffer.isBuffer(value)) return value;
@@ -87,12 +140,12 @@ const createMailer = () => {
 
 app.get("/api/health", (_request, response) => response.json({ ok: true }));
 
-app.get("/api/medicines", async (request, response) => {
-  try {
-    const idToken = request.headers.authorization?.replace(/^Bearer\s+/i, "");
-    if (!idToken) return response.status(401).json({ message: "Sign in to view medicines." });
+app.get("/api/auth/me", authenticate, (request, response) => {
+  return response.json({ uid: request.authUser.uid, role: request.authUser.role });
+});
 
-    await firebaseAuth.verifyIdToken(idToken);
+app.get("/api/medicines", authenticate, requireRoles("admin", "staff"), async (_request, response) => {
+  try {
     const records = await medicines
       .find({ isActive: { $ne: false } })
       .project({ name: 1, currentStock: 1, reorderLevel: 1 })
@@ -120,14 +173,7 @@ app.get("/api/medicines", async (request, response) => {
     return response.json({ medicines: inventory });
   } catch (error) {
     console.error("Medicine inventory request failed", error);
-    const invalidToken = [
-      "auth/argument-error",
-      "auth/id-token-expired",
-      "auth/invalid-id-token",
-    ].includes(error.code);
-    return response.status(invalidToken ? 401 : 500).json({
-      message: invalidToken ? "Your session has expired. Please log in again." : "Unable to load medicine inventory.",
-    });
+    return response.status(500).json({ message: "Unable to load medicine inventory." });
   }
 });
 
@@ -255,11 +301,13 @@ app.post("/api/auth/signup/complete", async (request, response) => {
       displayName: verification.name,
       emailVerified: true,
     });
+    const role = roleForEmail(verification.email);
     await firebaseAuth.setCustomUserClaims(user.uid, {
       ...(user.customClaims || {}),
       emailOtpVerified: true,
+      role,
     });
-    return response.json({ message: "Your email is verified and your account is ready." });
+    return response.json({ message: "Your email is verified and your account is ready.", role });
   } catch (error) {
     console.error("Signup completion failed", error);
     const badToken = error.name === "JsonWebTokenError" || error.name === "TokenExpiredError";
